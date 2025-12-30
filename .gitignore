@@ -1,0 +1,15 @@
+# Video files (too large for GitHub)
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+
+# Large binary files
+*.faiss
+*.pkl
+
+# Temporary files
+temp_*.pdf
+tmp_*.pdf
+

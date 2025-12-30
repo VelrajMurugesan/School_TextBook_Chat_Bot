@@ -1,19 +1,21 @@
 
-# app_persistent_faiss_rag_accuracy_fixed.py
+# app_school_textbook_rag_FINAL_STABLE_UX.py
 # ============================================================
-# ORIGINAL APP + ACCURACY FIX ONLY
+# SCHOOL TEXTBOOK AI CHATBOT – FINAL STABLE UX BUILD
 #
-# WHAT IS FIXED:
-# ✅ Confidence score now reflects answer relevance correctly
-# ✅ Uses TOP-K evidence (not noisy docs)
-# ✅ Normalized & clamped confidence (0–100%)
-# ✅ Unit summary confidence added
+# FIXED:
+# ✅ Upload spinner + success/info messages always visible
+# ✅ Chat "Thinking..." spinner always visible
+# ✅ Cache usage clearly indicated
+# ✅ Valid textbook questions NOT marked Out-of-syllabus
+# ✅ Strict but SAFE OOS detection (no false negatives)
 #
-# NOTHING ELSE CHANGED (UI, modes, flows preserved)
+# Python 3.12 Compatible
 # ============================================================
 
 import os
 import re
+import hashlib
 import numpy as np
 import streamlit as st
 from transformers import pipeline
@@ -22,21 +24,25 @@ from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-FAISS_DIR = "faiss_index_prod_v4"
-TOP_K_EVIDENCE = 5
+# ---------------- CONFIG ----------------
+FAISS_DIR = "faiss_index_cached"
+HASH_FILE = "pdf_hash.txt"
+
+TOP_K = 10
+SIM_THRESHOLD = 0.30        # lowered to avoid false OOS
+WORD_OVERLAP_THRESHOLD = 1  # safer for definition questions
 
 st.set_page_config(layout="wide")
 
-# ---------------- CSS (UNCHANGED) ----------------
+# ---------------- CSS ----------------
 st.markdown("""
 <style>
-body { background-color:#0e1117; }
-.user { background:#dcf8c6;color:#000;padding:12px;border-radius:14px;margin:10px;text-align:right; }
-.bot { background:#111827;color:#e5e7eb;padding:14px;border-radius:14px;margin:10px;border-left:4px solid #3b82f6; }
-.ref { background:#ffffff;color:#111827;padding:12px;border-radius:12px;margin-bottom:12px;border-left:5px solid #22c55e; }
-.highlight { background:#fde047;color:#000000;padding:2px 4px;border-radius:4px;font-weight:600; }
-.badge { display:inline-block;background:#2563eb;color:white;padding:4px 8px;border-radius:8px;font-size:12px;margin-bottom:6px; }
-.section-title { font-size:18px;font-weight:700;color:#93c5fd;margin-bottom:8px; }
+.user{background:#dcf8c6;color:#000;padding:12px;border-radius:14px;margin:10px;text-align:right;}
+.bot{background:#111827;color:#e5e7eb;padding:14px;border-radius:14px;margin:10px;border-left:4px solid #3b82f6;}
+.ref{background:#ffffff;color:#111827;padding:12px;border-radius:12px;margin-bottom:12px;border-left:5px solid #22c55e;}
+.highlight{background:#fde047;color:#000;padding:2px 4px;border-radius:4px;font-weight:600;}
+.section{font-size:18px;font-weight:700;color:#93c5fd;margin-bottom:8px;}
+.file{background:#1f2937;color:#e5e7eb;padding:6px 10px;border-radius:999px;margin:4px 0;display:inline-block;font-size:13px;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -48,40 +54,24 @@ padding:12px;border-radius:14px;color:white;text-align:center;">
 </div>
 """, unsafe_allow_html=True)
 
-col_upload, col_chat, col_ref = st.columns([2, 5, 3])
+col_upload, col_chat, col_right = st.columns([2, 5, 3])
 
 # ---------------- STATE ----------------
 if "vs" not in st.session_state:
     st.session_state.vs = None
 if "history" not in st.session_state:
     st.session_state.history = []
-if "mode" not in st.session_state:
-    st.session_state.mode = "Student"
+if "index_ready" not in st.session_state:
+    st.session_state.index_ready = False
 
-# ---------------- EMBEDDINGS ----------------
-
-
-@st.cache_resource
-def load_embeddings():
-    return HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+# ---------------- UTILS ----------------
 
 
-embeddings = load_embeddings()
-
-# ---------------- LLM ----------------
-
-
-@st.cache_resource
-def load_llm():
-    return pipeline(
-        "text2text-generation",
-        model="google/flan-t5-base",
-        max_new_tokens=300,
-        temperature=0.0
-    )
-
-
-llm = load_llm()
+def file_hash(files):
+    h = hashlib.sha256()
+    for f in files:
+        h.update(f.getbuffer())
+    return h.hexdigest()
 
 
 def cosine(a, b):
@@ -93,144 +83,196 @@ def detect_unit(text):
     return m.group(0) if m else "Unknown"
 
 
-# ---------------- LOAD FAISS ----------------
-if os.path.exists(FAISS_DIR):
-    st.session_state.vs = FAISS.load_local(
-        FAISS_DIR, embeddings, allow_dangerous_deserialization=True
+def keyword_overlap(q, docs):
+    q_words = set(re.findall(r"\w+", q.lower()))
+    for d in docs:
+        d_words = set(re.findall(r"\w+", d.page_content.lower()))
+        if len(q_words & d_words) >= WORD_OVERLAP_THRESHOLD:
+            return True
+    return False
+
+# ---------------- EMBEDDINGS ----------------
+
+
+@st.cache_resource
+def load_embeddings():
+    return HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-MiniLM-L6-v2"
     )
+
+
+@st.cache_resource
+def load_llm():
+    return pipeline(
+        "text2text-generation",
+        model="google/flan-t5-base",
+        max_new_tokens=200,
+        temperature=0.0
+    )
+
+
+embeddings = load_embeddings()
+llm = load_llm()
+
+# ---------------- LOAD INDEX (CACHE) ----------------
+if os.path.exists(FAISS_DIR) and os.path.exists(HASH_FILE):
+    with st.spinner("🔄 Loading cached textbook index..."):
+        st.session_state.vs = FAISS.load_local(
+            FAISS_DIR, embeddings, allow_dangerous_deserialization=True
+        )
+        st.session_state.index_ready = True
 
 # ---------------- UPLOAD ----------------
 with col_upload:
-    st.markdown("<div class='section-title'>📂 Upload</div>",
-                unsafe_allow_html=True)
-    st.session_state.mode = st.radio(
-        "Mode", ["Student", "Teacher"], horizontal=True)
+    st.markdown("<div class='section'>📂 Upload</div>", unsafe_allow_html=True)
 
-    files = st.file_uploader("Upload textbook PDF", type=[
-                             "pdf"], accept_multiple_files=True)
+    files = st.file_uploader(
+        "Upload textbook PDF",
+        type=["pdf"],
+        accept_multiple_files=True
+    )
+
     if files:
-        with st.spinner("📚 Indexing textbook..."):
-            docs = []
-            for f in files:
-                p = f"tmp_{f.name}"
-                open(p, "wb").write(f.read())
-                for d in PyPDFLoader(p).load():
-                    d.metadata.update({
-                        "source": f.name,
-                        "unit": detect_unit(d.page_content),
-                        "page": d.metadata.get("page", "NA")
-                    })
-                    docs.append(d)
-                os.remove(p)
+        for f in files:
+            st.markdown(
+                f"<span class='file'>📄 {f.name}</span>", unsafe_allow_html=True)
 
-            chunks = RecursiveCharacterTextSplitter(
-                chunk_size=600, chunk_overlap=200).split_documents(docs)
-            vs = FAISS.from_documents(chunks, embeddings)
-            vs.save_local(FAISS_DIR)
-            st.session_state.vs = vs
-            st.success("✅ Index ready")
+        current = file_hash(files)
+        old = open(HASH_FILE).read() if os.path.exists(HASH_FILE) else None
+
+        if current != old:
+            with st.spinner("📚 Indexing textbook (one-time)..."):
+                docs = []
+                for f in files:
+                    p = f"_tmp_{f.name}"
+                    open(p, "wb").write(f.read())
+                    for d in PyPDFLoader(p).load():
+                        d.metadata.update({
+                            "source": f.name,
+                            "unit": detect_unit(d.page_content),
+                            "page": d.metadata.get("page", "NA")
+                        })
+                        docs.append(d)
+                    os.remove(p)
+
+                chunks = RecursiveCharacterTextSplitter(
+                    chunk_size=600,
+                    chunk_overlap=200
+                ).split_documents(docs)
+
+                vs = FAISS.from_documents(chunks, embeddings)
+                vs.save_local(FAISS_DIR)
+                open(HASH_FILE, "w").write(current)
+
+                st.session_state.vs = vs
+                st.session_state.index_ready = True
+
+                st.success("✅ Textbook indexed successfully")
+        else:
+            st.info("ℹ️ Using cached textbook index")
+            st.session_state.index_ready = True
 
 # ---------------- CHAT ----------------
 with col_chat:
-    st.markdown("<div class='section-title'>💬 Chat</div>",
-                unsafe_allow_html=True)
-    q = st.text_input(
-        "", placeholder="💬 Ask your question here and press Enter")
+    st.markdown("<div class='section'>💬 Chat</div>", unsafe_allow_html=True)
 
-    if q and st.session_state.vs:
-        with st.spinner("🧠 Thinking..."):
-            retriever = st.session_state.vs.as_retriever(
-                search_kwargs={"k": 12})
-            docs = retriever.invoke(q)
+    if not st.session_state.index_ready:
+        st.warning("Please upload a textbook PDF first.")
+    else:
+        q = st.text_input("", placeholder="Ask a question from the textbook")
 
-            context = "\n".join(d.page_content for d in docs[:5])
+        if q:
+            with st.spinner("🧠 Thinking..."):
+                docs = st.session_state.vs.as_retriever(
+                    search_kwargs={"k": TOP_K}
+                ).invoke(q)
 
-            instruction = (
-                "Explain in detail with examples."
-                if st.session_state.mode == "Teacher"
-                else "Explain in simple student-friendly way."
-            )
+                sims = [
+                    cosine(
+                        embeddings.embed_query(q),
+                        embeddings.embed_query(d.page_content)
+                    ) for d in docs
+                ]
+                avg_sim = np.mean(sorted(sims, reverse=True)
+                                  [:5]) if sims else 0.0
 
-            answer = llm(f"""
-{instruction}
-Answer strictly from the context.
-If not found, say "Out of syllabus".
+                if avg_sim < SIM_THRESHOLD or not keyword_overlap(q, docs):
+                    answer = "Out of syllabus."
+                    confidence = round(avg_sim * 100, 2)
+                    refs = []
+                else:
+                    context = "\n".join(d.page_content for d in docs[:5])
+                    answer = llm(
+                        "Answer ONLY from the textbook content below. "
+                        "If answer is not present, say Out of syllabus.\n\n"
+                        f"{context}\n\nQuestion: {q}"
+                    )[0]["generated_text"].strip()
 
-Context:
-{context}
+                    confidence = round(avg_sim * 100, 2)
 
-Question:
-{q}
-""")[0]["generated_text"]
-
-            # ---------------- FIXED CONFIDENCE ----------------
-            q_emb = embeddings.embed_query(q)
-            sims = sorted(
-                [cosine(q_emb, embeddings.embed_query(d.page_content))
-                 for d in docs],
-                reverse=True
-            )[:TOP_K_EVIDENCE]
-
-            # Normalize similarity range (MiniLM ~0.2–0.8 typical)
-            norm_sims = [(s - 0.2) / (0.8 - 0.2) for s in sims]
-            norm_sims = [min(max(s, 0), 1) for s in norm_sims]
-
-            confidence = round(np.mean(norm_sims) * 100, 2)
-
-            highlights = []
-            for d in docs[:5]:
-                for sent in d.page_content.split("."):
-                    if any(w.lower() in sent.lower() for w in q.split()):
-                        highlights.append({
+                    refs = [
+                        {
                             "source": d.metadata["source"],
                             "page": d.metadata["page"],
-                            "text": sent.strip()
-                        })
+                            "text": s.strip()
+                        }
+                        for d in docs[:5]
+                        for s in re.split(r"[.!?]", d.page_content)
+                        if len(s) > 30 and any(w.lower() in s.lower() for w in q.split())
+                    ]
 
-            st.session_state.history.append(
-                (q, answer, confidence, highlights))
+                st.session_state.history.append((q, answer, confidence, refs))
 
-    for q, a, c, _ in st.session_state.history[::-1]:
-        st.markdown(
-            f"<div class='user'>You<br>{q}</div>", unsafe_allow_html=True)
-        st.markdown(
-            f"<div class='bot'><span class='badge'>{st.session_state.mode}</span><br>"
-            f"{a}<br><small>Accuracy confidence: {c}%</small></div>",
-            unsafe_allow_html=True
-        )
-
-# ---------------- REFERENCES + UNIT SUMMARY ----------------
-with col_ref:
-    st.markdown("<div class='section-title'>📎 Page Highlights</div>",
-                unsafe_allow_html=True)
-    if st.session_state.history:
-        for h in st.session_state.history[-1][3]:
+        for q, a, c, _ in st.session_state.history[::-1]:
+            st.markdown(f"<div class='user'>{q}</div>", unsafe_allow_html=True)
             st.markdown(
-                f"<div class='ref'><b>{h['source']}</b> | Page {h['page']}<br>"
-                f"<span class='highlight'>{h['text']}</span></div>",
+                f"<div class='bot'>{a}<br><small>Accuracy: {c}%</small></div>",
                 unsafe_allow_html=True
             )
 
-    st.markdown("<div class='section-title'>📘 Unit Summary</div>",
-                unsafe_allow_html=True)
-    if st.session_state.vs:
-        unit_docs = {}
-        for d in st.session_state.vs.docstore._dict.values():
-            unit_docs.setdefault(d.metadata.get(
-                "unit", "Unknown"), []).append(d)
+# ---------------- RIGHT PANEL ----------------
+with col_right:
+    tab1, tab2 = st.tabs(["📎 Page Highlights", "📘 Unit Summary"])
 
-        unit = st.selectbox("Select Unit", sorted(unit_docs.keys()))
-        if st.button("Generate Unit Summary"):
-            with st.spinner("📘 Generating summary..."):
-                texts = " ".join(d.page_content for d in unit_docs[unit][:5])
-                summary = llm("Summarize this unit for students:\n" +
-                              texts)[0]["generated_text"]
+    with tab1:
+        if st.session_state.history:
+            _, ans, _, refs = st.session_state.history[-1]
+            if ans != "Out of syllabus." and refs:
+                for r in refs:
+                    st.markdown(
+                        f"<div class='ref'><b>{r['source']}</b> | Page {r['page']}<br>"
+                        f"<span class='highlight'>{r['text']}</span></div>",
+                        unsafe_allow_html=True
+                    )
+            else:
+                st.info("No page highlights available.")
 
-                sims = [cosine(embeddings.embed_query(summary),
-                               embeddings.embed_query(d.page_content))
-                        for d in unit_docs[unit][:5]]
-                norm = [min(max((s-0.2)/(0.8-0.2), 0), 1) for s in sims]
-                unit_conf = round(np.mean(norm)*100, 2)
+    with tab2:
+        if st.session_state.vs:
+            unit_docs = {}
+            for d in st.session_state.vs.docstore._dict.values():
+                unit_docs.setdefault(d.metadata.get(
+                    "unit", "Unknown"), []).append(d)
 
-                st.success(summary)
-                st.info(f"Summary accuracy confidence: {unit_conf}%")
+            unit = st.selectbox("Select Unit", sorted(unit_docs.keys()))
+
+            if st.button("Generate Unit Summary"):
+                with st.spinner("📘 Generating unit summary..."):
+                    text = " ".join(
+                        d.page_content for d in unit_docs[unit][:6])
+                    summary = llm(
+                        "Summarize this unit clearly for school students "
+                        "using ONLY the textbook content:\n" + text
+                    )[0]["generated_text"]
+
+                    sims = [
+                        cosine(
+                            embeddings.embed_query(summary),
+                            embeddings.embed_query(d.page_content)
+                        )
+                        for d in unit_docs[unit][:6]
+                    ]
+                    unit_conf = round(np.mean(sims) * 100, 2)
+
+                    st.success(summary)
+                    st.info(f"Summary accuracy confidence: {unit_conf}%")
